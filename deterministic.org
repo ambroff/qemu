@@ -1,0 +1,319 @@
+#+TITLE: QEMU Deterministic Execution Plan
+#+AUTHOR: QEMU Development
+#+DATE: 2025-08-09
+#+OPTIONS: toc:2 num:t
+
+* Overview
+This document outlines a comprehensive plan to modify QEMU for completely deterministic VM execution. The goal is to ensure that VMs can be run repeatedly with 100% identical execution, eliminating all sources of non-determinism.
+
+** Key Requirements
+- Single-threaded execution regardless of guest CPU count
+- Deterministic timing based on instruction count
+- Reproducible I/O operations
+- Fixed random number generation
+- Predictable interrupt and event handling
+
+* Phase 1: Single-Threaded Execution
+** 1.1 Force Round-Robin TCG Mode
+*** Files to Modify
+- ~/usr/home/kyle/code/qemu/accel/tcg/tcg-accel-ops.c~
+- ~/usr/home/kyle/code/qemu/accel/tcg/tcg-all.c~
+
+*** Required Changes
+- Force ~use_icount = ICOUNT_PRECISE~ mode
+- Disable MTTCG completely by modifying ~qemu_tcg_mttcg_enabled()~ to always return false
+- Set ~qemu_tcg_configure()~ to use single-threaded mode regardless of guest CPU count
+- Modify round-robin scheduler to use deterministic time slices based on instruction count
+
+*** Implementation Details
+#+BEGIN_SRC c
+// In tcg-all.c
+bool qemu_tcg_mttcg_enabled(void)
+{
+    if (deterministic_mode) {
+        return false;  // Force single-threaded
+    }
+    return mttcg_enabled;
+}
+#+END_SRC
+
+** 1.2 Disable IOThreads
+*** Files to Modify
+- ~/usr/home/kyle/code/qemu/iothread.c~
+- ~/usr/home/kyle/code/qemu/util/thread-pool.c~
+
+*** Required Changes
+- Replace IOThread creation with synchronous execution
+- Convert thread pool operations to immediate synchronous execution
+- Remove ~aio_poll()~ background threads
+
+* Phase 2: Deterministic Time
+** 2.1 Virtual Clock Only
+*** Files to Modify
+- ~/usr/home/kyle/code/qemu/util/qemu-timer.c~
+- ~/usr/home/kyle/code/qemu/system/cpus.c~
+
+*** Required Changes
+- Make all clock types (~QEMU_CLOCK_REALTIME~, ~QEMU_CLOCK_HOST~) map to ~QEMU_CLOCK_VIRTUAL~
+- Remove ~get_clock_realtime()~ and ~gettimeofday()~ calls
+- Base all timing on instruction count via icount
+
+*** Implementation Strategy
+#+BEGIN_SRC c
+// In qemu-timer.c
+int64_t qemu_clock_get_ns(QEMUClockType type)
+{
+    if (deterministic_mode) {
+        type = QEMU_CLOCK_VIRTUAL;  // Force all clocks to virtual
+    }
+    // ... existing implementation
+}
+#+END_SRC
+
+** 2.2 Deterministic RTC
+*** Files to Modify
+- ~/usr/home/kyle/code/qemu/hw/rtc/mc146818rtc.c~
+- ~/usr/home/kyle/code/qemu/system/rtc.c~
+
+*** Required Changes
+- Fix RTC to a constant start time
+- Advance RTC based on virtual time only
+- Remove host time synchronization
+
+* Phase 3: Deterministic Randomness
+** 3.1 Seeded PRNG
+*** Files to Modify
+- ~/usr/home/kyle/code/qemu/util/guest-random.c~
+- ~/usr/home/kyle/code/qemu/crypto/random-platform.c~
+
+*** Required Changes
+- Force deterministic mode with fixed seed
+- Replace all ~qcrypto_random_bytes()~ with deterministic PRNG
+- Ensure thread-local PRNGs use predictable seeding
+
+*** Implementation
+#+BEGIN_SRC c
+// In guest-random.c
+int qemu_guest_getrandom(void *buf, size_t len, Error **errp)
+{
+    if (deterministic_mode) {
+        return qemu_guest_getrandom_nofail(buf, len);  // Uses seeded PRNG
+    }
+    // ... existing implementation
+}
+#+END_SRC
+
+** 3.2 Guest RNG Instructions
+*** Files to Modify
+- ~/usr/home/kyle/code/qemu/target/i386/tcg/int_helper.c~ (RDRAND)
+- ~/usr/home/kyle/code/qemu/target/arm/helper.c~ (RNDR/RNDRRS)
+- ~/usr/home/kyle/code/qemu/target/ppc/int_helper.c~ (DARN)
+
+*** Required Changes
+- Use deterministic PRNG for all guest RNG instructions
+- Remove entropy gathering from host
+
+* Phase 4: Deterministic I/O
+** 4.1 Synchronous Block I/O
+*** Files to Modify
+- ~/usr/home/kyle/code/qemu/block/block-backend.c~
+- ~/usr/home/kyle/code/qemu/block/linux-aio.c~
+- ~/usr/home/kyle/code/qemu/block/io_uring.c~
+
+*** Required Changes
+- Replace async I/O with synchronous operations
+- Process all I/O completions in deterministic order
+- Remove AIO event loops
+
+*** Key Considerations
+- Performance will be significantly impacted
+- May need to implement deterministic I/O scheduling
+- Consider replay-based approach for better performance
+
+** 4.2 Deterministic Network
+*** Files to Modify
+- ~/usr/home/kyle/code/qemu/net/tap.c~
+- ~/usr/home/kyle/code/qemu/net/socket.c~
+- ~/usr/home/kyle/code/qemu/hw/net/virtio-net.c~
+
+*** Required Changes
+- Record/replay network packets with timestamps
+- Process packets in deterministic batches
+- Remove interrupt coalescing timers
+
+* Phase 5: Event Loop Determinism
+** 5.1 Synchronous Event Processing
+*** Files to Modify
+- ~/usr/home/kyle/code/qemu/util/aio-posix.c~
+- ~/usr/home/kyle/code/qemu/util/fdmon-epoll.c~
+- ~/usr/home/kyle/code/qemu/util/main-loop.c~
+
+*** Required Changes
+- Process events in fixed order (by FD number)
+- Remove adaptive polling
+- Make all timeouts instruction-count based
+
+*** Implementation Approach
+#+BEGIN_SRC c
+// In aio-posix.c
+bool aio_poll(AioContext *ctx, bool blocking)
+{
+    if (deterministic_mode) {
+        // Process in deterministic order
+        return aio_poll_deterministic(ctx);
+    }
+    // ... existing implementation
+}
+#+END_SRC
+
+** 5.2 Bottom Half Ordering
+*** Files to Modify
+- ~/usr/home/kyle/code/qemu/util/async.c~
+
+*** Required Changes
+- Execute BHs in deterministic order (creation order or priority)
+- Remove timing-based scheduling
+
+* Phase 6: Device Emulation
+** 6.1 Timer Devices
+*** Files to Modify
+- All timer devices in ~/usr/home/kyle/code/qemu/hw/timer/~
+
+*** Required Changes
+- Base all timers on virtual clock
+- Remove host time dependencies
+- Fix timer firing order
+
+** 6.2 Interrupt Controller
+*** Files to Modify
+- ~/usr/home/kyle/code/qemu/hw/intc/~ (various interrupt controllers)
+
+*** Required Changes
+- Process interrupts in deterministic order
+- Remove race conditions in interrupt delivery
+
+* Implementation Strategy
+** Configuration Structure
+#+BEGIN_SRC c
+// New deterministic configuration structure
+struct DeterministicConfig {
+    bool enabled;
+    uint64_t random_seed;
+    uint64_t start_time;
+    bool force_icount;
+    bool disable_mttcg;
+    bool sync_io_only;
+};
+#+END_SRC
+
+** Command Line Options
+#+BEGIN_SRC bash
+# New command line option
+qemu-system-x86_64 --deterministic \
+    --deterministic-seed=12345 \
+    --deterministic-time="2024-01-01 00:00:00" \
+    [other options]
+#+END_SRC
+
+** Build Configuration
+#+BEGIN_SRC bash
+# Configure with deterministic support
+../configure --enable-deterministic
+
+# Or via meson
+meson setup build -Ddeterministic=enabled
+#+END_SRC
+
+* Testing Framework
+** Test Suite Requirements
+- [ ] Instruction-by-instruction comparison
+- [ ] Memory state verification
+- [ ] I/O operation replay
+- [ ] Interrupt timing validation
+
+** Test Implementation
+#+BEGIN_SRC python
+# Example test script
+def test_deterministic_execution():
+    # Run VM twice with same inputs
+    trace1 = run_qemu_deterministic(seed=12345)
+    trace2 = run_qemu_deterministic(seed=12345)
+    
+    # Compare execution traces
+    assert trace1 == trace2
+#+END_SRC
+
+* Performance Considerations
+** Expected Impact
+| Component | Performance Impact | Mitigation Strategy |
+|-----------+-------------------+--------------------|
+| Single-threaded CPU | High (no SMP benefit) | Use icount optimization |
+| Synchronous I/O | Very High | Implement deterministic async |
+| Network | Medium | Batch processing |
+| Timers | Low | Already virtual in icount |
+
+** Optimization Opportunities
+1. Deterministic parallel execution (research required)
+2. Predictable async I/O scheduling
+3. Instruction count caching
+4. Optimized virtual time calculation
+
+* Roadmap
+** Milestone 1: Basic Determinism (Month 1)
+- [ ] Single-threaded execution
+- [ ] Virtual clock only
+- [ ] Basic PRNG seeding
+
+** Milestone 2: I/O Determinism (Month 2)
+- [ ] Synchronous disk I/O
+- [ ] Network packet replay
+- [ ] Event loop ordering
+
+** Milestone 3: Complete Determinism (Month 3)
+- [ ] Device emulation fixes
+- [ ] Interrupt controller ordering
+- [ ] Comprehensive testing
+
+** Milestone 4: Optimization (Month 4)
+- [ ] Performance profiling
+- [ ] Optimization implementation
+- [ ] Production readiness
+
+* Known Challenges
+** Technical Challenges
+1. *Host system dependencies*: File system operations may vary
+2. *Floating-point operations*: May need strict IEEE 754 compliance
+3. *Memory allocation*: Address space randomization affects pointers
+4. *Signal delivery*: Host signals need careful handling
+
+** Solutions
+- Use fixed memory layout
+- Disable ASLR for QEMU process
+- Implement deterministic allocator
+- Queue and replay signals
+
+* References
+** Key Source Files
+- MTTCG Documentation: ~/usr/home/kyle/code/qemu/docs/devel/multi-thread-tcg.rst~
+- icount Implementation: ~/usr/home/kyle/code/qemu/accel/tcg/icount-common.c~
+- Guest Random: ~/usr/home/kyle/code/qemu/util/guest-random.c~
+- Timer System: ~/usr/home/kyle/code/qemu/util/qemu-timer.c~
+
+** Related QEMU Features
+- Record/Replay System (replay mode)
+- icount (instruction counting)
+- Savevm/Loadvm (snapshot support)
+- Migration (state serialization)
+
+* Appendix: Non-Determinism Sources
+** Identified Sources
+| Source | Location | Impact | Solution |
+|--------+----------+--------+----------|
+| MTTCG | accel/tcg/tcg-accel-ops-mttcg.c | High | Force single-thread |
+| System time | util/qemu-timer.c:get_clock_realtime() | High | Use virtual clock |
+| Random numbers | util/guest-random.c | High | Seeded PRNG |
+| Linux AIO | block/linux-aio.c | Medium | Sync I/O |
+| Network packets | net/tap.c | Medium | Replay system |
+| epoll ordering | util/fdmon-epoll.c | Low | Fixed order |
+| Thread pool | util/thread-pool.c | Medium | Synchronous execution |
+| Bottom halves | util/async.c | Low | Deterministic scheduling |
