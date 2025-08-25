@@ -5153,6 +5153,53 @@ SRST
     specifies the snapshot name used to load the initial VM state.
 ERST
 
+DEF("deterministic", 0, QEMU_OPTION_deterministic,
+    "-deterministic  enable deterministic execution mode\n", QEMU_ARCH_ALL)
+SRST
+``-deterministic``
+    Enable deterministic execution mode. This forces single-threaded
+    execution with virtual time based on instruction counting. All
+    sources of non-determinism are eliminated including threading,
+    wall-clock time, and random number generation. This mode is useful
+    for reproducible debugging and fuzzing but significantly impacts
+    performance.
+ERST
+
+DEF("deterministic-seed", HAS_ARG, QEMU_OPTION_deterministic_seed,
+    "-deterministic-seed seed\n"
+    "                set the seed for pseudo-random number generation\n"
+    "                in deterministic mode (default: 0)\n", QEMU_ARCH_ALL)
+SRST
+``-deterministic-seed seed``
+    Set the seed value for the pseudo-random number generator used in
+    deterministic mode. This ensures that all random number generation
+    is reproducible across runs with the same seed.
+ERST
+
+DEF("deterministic-time", HAS_ARG, QEMU_OPTION_deterministic_time,
+    "-deterministic-time time\n"
+    "                set initial virtual time in deterministic mode\n"
+    "                format: 'YYYY-MM-DD HH:MM:SS' or unix timestamp\n", QEMU_ARCH_ALL)
+SRST
+``-deterministic-time time``
+    Set the initial virtual time for deterministic mode. The time can be
+    specified either as a Unix timestamp (seconds since epoch) or as a
+    formatted string 'YYYY-MM-DD HH:MM:SS'. This sets the starting point
+    for all virtual clocks in the system.
+ERST
+
+DEF("deterministic-instr-slice", HAS_ARG, QEMU_OPTION_deterministic_instr_slice,
+    "-deterministic-instr-slice n\n"
+    "                set the number of instructions per scheduler slice\n"
+    "                in deterministic mode (default: 10000)\n", QEMU_ARCH_ALL)
+SRST
+``-deterministic-instr-slice n``
+    Set the number of instructions to execute per scheduler slice in
+    deterministic mode. This controls the granularity of virtual time
+    advancement and I/O scheduling. Lower values provide finer control
+    but may impact performance.
+ERST
+
 DEF("watchdog-action", HAS_ARG, QEMU_OPTION_watchdog_action, \
     "-watchdog-action reset|shutdown|poweroff|inject-nmi|pause|debug|none\n" \
     "                action when watchdog fires [default=reset]\n",

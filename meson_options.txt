@@ -89,6 +89,8 @@ option('debug_tcg', type: 'boolean', value: false,
        description: 'TCG debugging')
 option('debug_remap', type: 'boolean', value: false,
        description: 'syscall buffer debugging support')
+option('deterministic', type: 'boolean', value: false,
+       description: 'build with deterministic execution support')
 option('tcg_interpreter', type: 'boolean', value: false,
        description: 'TCG with bytecode interpreter (slow)')
 option('safe_stack', type: 'boolean', value: false,

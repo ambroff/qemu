@@ -23,11 +23,13 @@
  */
 
 #include "qemu/osdep.h"
+#include <time.h>
 #include "qemu/help-texts.h"
 #include "qemu/datadir.h"
 #include "qemu/units.h"
 #include "qemu/module.h"
 #include "qemu/target-info.h"
+#include "qemu/deterministic.h"
 #include "exec/cpu-common.h"
 #include "exec/page-vary.h"
 #include "hw/qdev-properties.h"
@@ -191,6 +193,20 @@ static const char *log_file;
 static bool list_data_dirs;
 static const char *qtest_chrdev;
 static const char *qtest_log;
+
+/* Deterministic execution configuration */
+DeterministicConfig deterministic_cfg = {0};
+
+void deterministic_init_config(void)
+{
+    /* Set default values */
+    deterministic_cfg.enabled = false;
+    deterministic_cfg.random_seed = 0;
+    deterministic_cfg.start_time_ns = 0; /* January 1, 1970 00:00:00 */
+    deterministic_cfg.instr_slice = 10000;
+    deterministic_cfg.force_icount = true;
+    deterministic_cfg.disable_mttcg = true;
+}
 
 static int has_defaults = 1;
 static int default_audio = 1;
@@ -3540,6 +3556,61 @@ void qemu_init(int argc, char **argv)
                                                       optarg, true);
                 if (!icount_opts) {
                     exit(1);
+                }
+                break;
+            case QEMU_OPTION_deterministic:
+                deterministic_init_config();
+                deterministic_cfg.enabled = true;
+                /* Force icount mode for deterministic execution */
+                if (!icount_opts) {
+                    icount_opts = qemu_opts_create(qemu_find_opts("icount"), 
+                                                    NULL, 0, &error_abort);
+                    qemu_opt_set(icount_opts, "shift", "auto", &error_abort);
+                    qemu_opt_set(icount_opts, "sleep", "off", &error_abort);
+                }
+                break;
+            case QEMU_OPTION_deterministic_seed:
+                {
+                    char *endptr;
+                    deterministic_cfg.random_seed = strtoull(optarg, &endptr, 0);
+                    if (*endptr) {
+                        error_report("Invalid deterministic seed: %s", optarg);
+                        exit(1);
+                    }
+                }
+                break;
+            case QEMU_OPTION_deterministic_time:
+                {
+                    char *endptr;
+                    /* First try parsing as Unix timestamp */
+                    uint64_t timestamp = strtoull(optarg, &endptr, 10);
+                    if (*endptr == '\0') {
+                        deterministic_cfg.start_time_ns = timestamp * 1000000000ULL;
+                    } else {
+                        /* Try parsing as formatted date/time */
+                        struct tm tm = {0};
+                        if (strptime(optarg, "%Y-%m-%d %H:%M:%S", &tm) == NULL) {
+                            error_report("Invalid deterministic time format: %s", optarg);
+                            error_report("Use 'YYYY-MM-DD HH:MM:SS' or Unix timestamp");
+                            exit(1);
+                        }
+                        time_t t = mktime(&tm);
+                        if (t == -1) {
+                            error_report("Invalid deterministic time: %s", optarg);
+                            exit(1);
+                        }
+                        deterministic_cfg.start_time_ns = (uint64_t)t * 1000000000ULL;
+                    }
+                }
+                break;
+            case QEMU_OPTION_deterministic_instr_slice:
+                {
+                    char *endptr;
+                    deterministic_cfg.instr_slice = strtoull(optarg, &endptr, 0);
+                    if (*endptr || deterministic_cfg.instr_slice == 0) {
+                        error_report("Invalid instruction slice: %s", optarg);
+                        exit(1);
+                    }
                 }
                 break;
             case QEMU_OPTION_incoming:
