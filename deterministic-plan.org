@@ -1,0 +1,568 @@
+#+TITLE: Comprehensive QEMU Deterministic Execution Implementation Plan
+#+AUTHOR: QEMU Development Team
+#+DATE: 2025-08-25
+#+OPTIONS: toc:3 num:t
+
+* Executive Summary
+This document consolidates all research, analysis, and planning for implementing deterministic execution in QEMU. It combines:
+- High-level architectural changes from the original deterministic.org plan
+- Detailed code-level implementation from the validation documents
+- Lessons learned from Northguard's deterministic simulation framework
+- Gap analysis identifying missing components
+
+The goal is to ensure QEMU can execute VMs with 100% deterministic, reproducible behavior for fuzzing, testing, and debugging purposes.
+
+* Overview and Requirements
+** Core Objectives
+- Complete determinism: Identical execution across runs with same inputs
+- Single-threaded execution: Eliminate all threading non-determinism
+- Virtual time: All timing based on instruction count, not wall clock
+- Reproducible I/O: Deterministic ordering of all I/O operations
+- Fixed randomness: Seeded PRNG for all random number generation
+
+** Comparison with Northguard
+The Northguard simulator provides a reference implementation demonstrating:
+- Frame-based deterministic clock advancing
+- Single-threaded event processing with deferred callbacks
+- Seeded random number generation
+- Deterministic network and file system simulation
+- Complete isolation from host timing
+
+** Critical Gaps Identified
+1. *All QEMU threads must be eliminated* - Not just MTTCG/IOThreads
+2. *Guest-visible timers need control* - TSC, HPET, ACPI timers
+3. *Complete device audit required* - All devices need deterministic behavior
+4. *Host interactions must be controlled* - File system, signals, environment
+5. *Memory allocation determinism* - ASLR and malloc ordering
+6. *Scheduling algorithm needed* - Not just "process by FD number"
+7. *Comprehensive testing framework* - Trace comparison and validation
+
+* Phase 1: Configuration Infrastructure
+** 1.1 Configuration Structure
+*** Implementation
+Create new header ~include/qemu/deterministic.h~:
+#+BEGIN_SRC c
+typedef struct DeterministicConfig {
+    bool enabled;           /* enable deterministic mode */
+    uint64_t random_seed;   /* seed for pseudo-random generator */
+    uint64_t start_time_ns; /* initial virtual time in nanoseconds */
+    uint64_t instr_slice;   /* number of instructions per scheduler slice */
+    bool force_icount;      /* force ICOUNT_PRECISE */
+    bool disable_mttcg;     /* disable multi-thread TCG */
+} DeterministicConfig;
+
+extern DeterministicConfig deterministic_cfg;
+#+END_SRC
+
+** 1.2 Command Line Interface
+*** Files to Modify
+- ~qemu-options.hx~
+- ~vl.c~
+
+*** New Options
+- ~--deterministic~ - Enable deterministic mode
+- ~--deterministic-seed=<n>~ - Set PRNG seed
+- ~--deterministic-time=<YYYY-mm-dd HH:MM:SS>~ - Set initial time
+- ~--deterministic-instr-slice=<n>~ - Instructions per scheduler slice
+
+*** Implementation
+When ~--deterministic~ is specified:
+1. Populate ~deterministic_cfg~ structure
+2. Force ~global_state.icount = true~
+3. Set appropriate defaults for other options
+
+** 1.3 Build System Integration
+*** Meson Configuration
+Add option ~-Ddeterministic=enabled~ to compile deterministic code paths
+Provide stub implementations when disabled
+
+* Phase 2: Thread Elimination and Single-Threaded Execution
+** 2.1 TCG Threading Changes
+*** Files to Modify
+- ~accel/tcg/tcg-all.c~
+- ~accel/tcg/tcg-accel-ops.c~
+- ~accel/tcg/cpu-exec-common.c~
+
+*** Implementation
+#+BEGIN_SRC c
+// In tcg-all.c
+bool qemu_tcg_mttcg_enabled(void) {
+    if (deterministic_cfg.enabled) {
+        return false;  // Force single-threaded
+    }
+    return mttcg_enabled;
+}
+
+// In tcg-accel-ops.c - modify qemu_tcg_configure()
+if (deterministic_cfg.enabled) {
+    smp_cpus = 1;
+    tcg_max_threads = 1;
+    use_icount = ICOUNT_PRECISE;
+}
+#+END_SRC
+
+*** CPU Execution Loop
+Modify ~accel/tcg/cpu-exec-common.c~ to run exactly ~deterministic_cfg.instr_slice~ instructions before returning to main loop
+
+** 2.2 Complete Thread Elimination
+*** IOThreads
+*Files:* ~iothread.c~
+*Changes:* Replace with stub that queues callbacks to main event queue
+
+*** Thread Pool
+*Files:* ~util/thread-pool.c~
+*Changes:* Make ~qemu_thread_pool_submit()~ execute jobs immediately
+
+*** vhost and vGPU Threads
+*Changes:* Disable vhost acceleration, fall back to userspace implementation
+
+*** Asynchronous Block Backends
+*Files:* ~block/linux-aio.c~, ~block/io_uring.c~
+*Changes:* Disable async backends, use synchronous I/O only
+
+*** Migration and QMP Monitor
+*Changes:* Disable these threads entirely for deterministic mode
+
+*** Audio and SPICE Threads
+*Changes:* Provide synchronous stubs or disable entirely
+
+*** GLib Worker Threads
+*Changes:* Prevent GLib from spawning background threads
+
+** 2.3 Central Event Queue
+*** New Infrastructure
+Create deterministic event queue in ~util/main-loop.c~:
+
+#+BEGIN_SRC c
+void deterministic_queue_init(void);
+void deterministic_queue_push(uint64_t when_instrs, void (*cb)(void *), void *opaque);
+void deterministic_queue_run(uint64_t current_icount);
+#+END_SRC
+
+*** Integration
+All operations that would use threads must instead queue callbacks with instruction count timestamps
+
+* Phase 3: Deterministic Time and Clocks
+** 3.1 Virtual Clock System
+*** Global Virtual Time
+Create global ~virtual_time_ns~ counter initialized from ~deterministic_cfg.start_time_ns~
+
+*** Files to Modify
+- ~util/qemu-timer.c~
+- ~system/cpus.c~
+- ~accel/tcg/icount-common.c~
+
+*** Implementation
+#+BEGIN_SRC c
+// In qemu-timer.c
+int64_t qemu_clock_get_ns(QEMUClockType type) {
+    if (deterministic_cfg.enabled) {
+        return virtual_time_ns;  // All clocks return virtual time
+    }
+    // ... existing implementation
+}
+#+END_SRC
+
+*** Time Advancement
+After each CPU slice: ~virtual_time_ns += instr_slice * nanoseconds_per_instruction~
+
+** 3.2 Guest-Visible Timer Control
+*** x86 TSC
+*Files:* ~target/i386/helper.c~
+*Implementation:*
+- ~helper_rdtsc()~ returns cycles based on ~virtual_time_ns~
+- Use fixed TSC frequency (e.g., 2.5 GHz)
+- Base value seeded from ~deterministic_cfg.start_time_ns~
+
+*** HPET
+*Files:* ~hw/timer/hpet.c~
+*Implementation:*
+- Set ~hpet->hpet_counter~ based on ~virtual_time_ns~
+- Update comparators on each ~advance_virtual_time()~ call
+
+*** ACPI PM Timer
+*Files:* ~hw/acpi/pmtimer.c~
+*Implementation:*
+- Base 24-bit counter on ~virtual_time_ns / 3.579545 MHz~
+
+*** RTC
+*Files:* ~hw/rtc/mc146818rtc.c~, ~system/rtc.c~
+*Implementation:*
+- Initialize to ~deterministic_cfg.start_time_ns~
+- Update only when virtual time advances
+- Disable host time synchronization
+
+*** Paravirtual Clocks
+*Implementation:* KVM clock and Hyper-V clocks return ~virtual_time_ns~
+
+** 3.3 Device Timer Conversion
+*** All Timer Devices
+*Files:* All files in ~hw/timer/~
+*Changes:*
+1. Replace ~qemu_clock_get_ns()~ with ~virtual_time_ns~
+2. Convert timer delays to instruction counts
+3. Enqueue callbacks in deterministic queue
+
+* Phase 4: Deterministic Random Number Generation
+** 4.1 Global PRNG Infrastructure
+*** Implementation
+Create global ~QEMURandomState~ with seeded generator:
+#+BEGIN_SRC c
+// Expose functions:
+deterministic_random_bytes(void *buf, size_t len);
+deterministic_random_u64();
+#+END_SRC
+
+** 4.2 Guest Random Sources
+*** Guest Random API
+*Files:* ~util/guest-random.c~
+*Changes:* Use ~deterministic_random_bytes()~ instead of platform RNG
+
+*** Crypto Layer
+*Files:* ~crypto/random-platform.c~
+*Changes:* Return bytes from deterministic PRNG when enabled
+
+** 4.3 CPU RNG Instructions
+*** x86 RDRAND
+*Files:* ~target/i386/tcg/int_helper.c~
+*Changes:* ~helper_rdrand_RdRNG()~ uses ~deterministic_random_u64()~
+
+*** ARM RNDR/RNDRRS
+*Files:* ~target/arm/helper.c~
+*Changes:* Use deterministic PRNG
+
+*** PowerPC DARN
+*Files:* ~target/ppc/int_helper.c~
+*Changes:* Modify ~helper_darn()~ similarly
+
+*** virtio-rng
+*Files:* ~hw/virtio/virtio-rng.c~
+*Changes:* Provide deterministic backend using ~deterministic_random_bytes()~
+
+* Phase 5: Deterministic I/O
+** 5.1 Block I/O
+*** Synchronous Operations
+*Files:* ~block/block-backend.c~
+*Implementation:*
+1. Intercept ~blk_aio_readv()~ and ~blk_aio_writev()~
+2. Perform synchronous read/write using ~pread()~/~pwrite()~
+3. Queue completion callback with emulated latency (e.g., 100 µs per 4 KiB)
+4. Maintain FIFO for operation ordering
+
+*** Backend Disabling
+*Files:* ~block/linux-aio.c~, ~block/io_uring.c~
+*Changes:* Return error or fall back to sync I/O
+
+** 5.2 Network I/O
+*** Deterministic Network Queue
+Create ~DeterministicNetQueue~ in ~net/net.c~:
+- Record incoming/outgoing packets with timestamps
+- Deliver packets in timestamp order
+- Support replay from recorded traces
+
+*** Implementation
+*Files:* ~net/tap.c~, ~net/socket.c~
+*Changes:* Disable host network interaction in deterministic mode
+
+*Files:* ~hw/net/virtio-net.c~
+*Changes:* Queue packets locally, avoid host queue pairs
+
+** 5.3 File System and Host I/O
+*** Deterministic File Model
+Similar to Northguard's ~FileSystemModel~:
+- Maintain in-memory representation of files
+- Emulate latency for operations
+- Support error injection
+- Disable passthrough (virtio-fs, 9P) in deterministic mode
+
+* Phase 6: Event Loop and Scheduling
+** 6.1 Main Event Loop
+*** Deterministic Polling
+*Files:* ~util/aio-posix.c~
+Replace ~aio_poll()~ with ~aio_poll_deterministic()~:
+- Process FDs in numeric order
+- Schedule callbacks in deterministic queue
+
+*** Main Scheduler Loop
+*Files:* ~util/main-loop.c~
+#+BEGIN_SRC c
+while (true) {
+    /* Execute guest instruction slice */
+    executed = qemu_cpu_exec_slice(cpu, deterministic_cfg.instr_slice);
+    global_icount += executed;
+    advance_virtual_time(executed);
+    
+    /* Process deterministic queue callbacks */
+    deterministic_queue_run(global_icount);
+    
+    /* Process timers and bottom halves */
+    process_timers_and_bhs();
+}
+#+END_SRC
+
+** 6.2 Bottom Half Ordering
+*** Implementation
+*Files:* ~util/async.c~
+- Add insertion index to each ~QEMUBH~
+- Queue in deterministic queue with current instruction count
+- Execute in insertion order when multiple ready
+
+** 6.3 File Descriptor Monitoring
+*Files:* ~util/fdmon-epoll.c~
+- Disable adaptive polling
+- Reorder events by FD number
+
+* Phase 7: Device Emulation
+** 7.1 Timer Devices
+*Files:* All under ~hw/timer/~ (pit.c, hpet.c, mc146818rtc.c)
+*Changes:*
+- Schedule via deterministic queue
+- Use ~virtual_time_ns~
+- Remove host time reliance
+
+** 7.2 Interrupt Controllers
+*Files:* ~hw/intc/~ (APIC, GIC, OpenPIC)
+*Changes:*
+- Deliver interrupts in deterministic priority order
+- Queue interrupt delivery via deterministic queue
+
+** 7.3 Virtio Devices
+*Audit Required:* blk, net, scsi, rng, fs, gpu
+*Changes:*
+- No kernel threads
+- Replace async callbacks with deterministic queue
+
+** 7.4 Other Devices
+- USB, audio, GPU: Disable in deterministic mode
+- Passthrough devices: Disable or record/replay
+
+* Phase 8: Memory and System
+** 8.1 ASLR and Memory Allocation
+*** ASLR Disabling
+*Files:* ~vl.c~
+*Implementation:*
+- Use ~personality(ADDR_NO_RANDOMIZE)~ on Linux
+- Document requirement: ~setarch -R~
+
+*** Deterministic Allocator
+Optional: Wrap ~malloc~ to return predictable addresses
+
+*** Fixed Memory Regions
+Ensure guest RAM and MMIO at fixed addresses
+
+** 8.2 Host Signal Handling
+Queue and replay signals deterministically
+
+* Phase 9: Testing Infrastructure
+** 9.1 Execution Tracing
+*** Implementation
+*Files:* ~cpus.c~
+- Record instruction counts
+- Save register/memory checkpoints
+- Provide ~save_execution_trace()~ and ~compare_execution_trace()~
+
+** 9.2 I/O Recording
+- Network packet traces
+- Disk I/O operations (operation, offset, size, data)
+- Virtual time stamps for all operations
+
+** 9.3 Test Suite
+*** Location
+~tests/deterministic/~
+
+*** Test Coverage
+- Boot simple kernels
+- Perform I/O operations
+- Verify identical traces across runs
+- Test different seeds produce different random outputs
+
+** 9.4 Property-Based Testing
+Fuzzing harnesses that generate random instruction sequences and verify deterministic behavior
+
+* Phase 10: Performance Optimization
+** 10.1 Expected Impact
+| Component | Performance Impact | Mitigation Strategy |
+|-----------+-------------------+--------------------|
+| Single-threaded CPU | High (no SMP) | icount optimization |
+| Synchronous I/O | Very High | Deterministic async scheduling |
+| Network | Medium | Batch processing |
+| Instrumentation | Medium | Selective tracing |
+
+** 10.2 Optimization Strategies
+- Adjustable ~instr_slice~ for latency/throughput trade-off
+- Process multiple instruction slices before I/O
+- Limited multi-threading with deterministic scheduler
+
+* Implementation Roadmap
+** Milestone 1: Core Infrastructure (Weeks 1-2)
+- [X] Configuration structure (deterministic.h exists)
+- [ ] Command line parsing
+- [ ] Build system integration
+- [ ] Basic test framework
+
+** Milestone 2: Threading and Execution (Weeks 3-4)
+- [ ] Force single-threaded TCG
+- [ ] Eliminate all subsystem threads
+- [ ] Implement central event queue
+- [ ] Deterministic scheduler loop
+
+** Milestone 3: Time and Randomness (Weeks 5-6)
+- [ ] Virtual clock implementation
+- [ ] Guest-visible timer control
+- [ ] Device timer conversion
+- [ ] Deterministic PRNG
+
+** Milestone 4: I/O Determinism (Weeks 7-8)
+- [ ] Synchronous block I/O
+- [ ] Network queue implementation
+- [ ] File system determinism
+- [ ] Event loop ordering
+
+** Milestone 5: Device Support (Weeks 9-10)
+- [ ] Timer device audit
+- [ ] Interrupt controller fixes
+- [ ] Virtio device changes
+- [ ] Device disable list
+
+** Milestone 6: System Integration (Weeks 11-12)
+- [ ] Memory determinism
+- [ ] Signal handling
+- [ ] Complete testing suite
+- [ ] Performance profiling
+
+** Milestone 7: Validation and Optimization (Weeks 13-14)
+- [ ] Comprehensive testing
+- [ ] Bug fixes
+- [ ] Performance optimization
+- [ ] Documentation
+
+* Critical Success Factors
+** Must Have
+1. 100% deterministic execution for same inputs
+2. Single-threaded operation
+3. Virtual time based on instruction count
+4. Seeded random numbers
+5. Ordered I/O operations
+
+** Should Have
+1. Reasonable performance for testing/fuzzing
+2. Support for common devices
+3. Network replay capability
+4. Comprehensive test coverage
+
+** Nice to Have
+1. Deterministic parallel execution research
+2. Performance within 10x of normal execution
+3. Live migration support in deterministic mode
+
+* Known Issues and Risks
+** Technical Challenges
+1. *Floating-point operations* - May need strict IEEE 754 mode
+2. *JIT compilation* - TCG translation cache determinism
+3. *Memory model* - Guest may depend on memory layout
+4. *External dependencies* - Libraries may spawn threads
+
+** Risk Mitigation
+1. Use fixed FP rounding modes
+2. Deterministic translation cache policy
+3. Fixed memory base addresses
+4. Audit and patch external libraries
+
+* Validation Criteria
+** Functional Requirements
+- [ ] Identical CPU instruction traces across runs
+- [ ] Same memory state at each checkpoint
+- [ ] Reproducible I/O operations
+- [ ] Deterministic interrupt timing
+- [ ] Fixed random number sequences
+
+** Performance Requirements
+- [ ] Single-threaded execution works correctly
+- [ ] Performance adequate for fuzzing (>1M instructions/sec)
+- [ ] Memory usage reasonable (<2x normal)
+
+** Test Requirements
+- [ ] Unit tests for each subsystem
+- [ ] Integration tests for full system
+- [ ] Regression tests for determinism
+- [ ] Performance benchmarks
+
+* References and Resources
+** Key QEMU Source Files
+- ~accel/tcg/tcg-all.c~ - TCG configuration
+- ~accel/tcg/icount-common.c~ - Instruction counting
+- ~util/qemu-timer.c~ - Timer subsystem
+- ~util/guest-random.c~ - Guest randomness
+- ~util/main-loop.c~ - Main event loop
+- ~util/async.c~ - Async/BH infrastructure
+
+** Related QEMU Features
+- icount - Instruction counting mode
+- Record/Replay - Existing replay system
+- Savevm/Loadvm - Snapshot support
+- Migration - State serialization
+
+** External References
+- Northguard Simulator - Reference deterministic implementation
+- IEEE 754 - Floating-point standard
+- Linux personality(2) - ASLR control
+
+* Appendix A: Source File Change Summary
+** New Files
+- ~include/qemu/deterministic.h~ - Configuration structure ✓
+- ~util/deterministic-queue.c~ - Event queue implementation
+- ~tests/deterministic/~ - Test suite
+
+** Modified Files by Subsystem
+*** Core Execution (10 files)
+- TCG configuration and execution
+- Main loop and scheduling
+- CPU execution control
+
+*** Time and Clocks (15+ files)
+- Timer subsystem
+- All timer devices
+- Guest-visible clocks
+
+*** I/O Subsystem (20+ files)
+- Block layer
+- Network stack
+- File system interface
+
+*** Devices (30+ files)
+- All timer devices
+- Interrupt controllers
+- Virtio devices
+- Other device emulation
+
+* Appendix B: Testing Checklist
+** Unit Tests
+- [ ] Configuration parsing
+- [ ] Event queue ordering
+- [ ] Virtual time advancement
+- [ ] PRNG determinism
+- [ ] I/O ordering
+
+** Integration Tests
+- [ ] Boot Linux kernel
+- [ ] Run simple applications
+- [ ] Network communication
+- [ ] Disk I/O operations
+- [ ] Timer operations
+
+** Determinism Tests
+- [ ] Trace comparison
+- [ ] Memory state verification
+- [ ] I/O replay accuracy
+- [ ] Interrupt timing
+
+** Performance Tests
+- [ ] Instruction throughput
+- [ ] I/O latency
+- [ ] Memory usage
+- [ ] Startup time
+
+* Conclusion
+This comprehensive plan provides a complete roadmap for implementing deterministic execution in QEMU. It addresses all identified gaps, incorporates lessons from Northguard's implementation, and provides detailed technical specifications for each component.
+
+The implementation will require significant changes across QEMU's codebase but will enable powerful new capabilities for fuzzing, debugging, and testing. Success depends on thorough elimination of all non-deterministic behavior sources and careful attention to ordering and timing throughout the system.
