@@ -24,6 +24,7 @@
 #include "qemu/error-report.h"
 #include "qemu/rcu.h"
 #include "qemu/main-loop.h"
+#include "qemu/deterministic.h"
 
 
 #ifdef CONFIG_POSIX
@@ -94,8 +95,14 @@ void iothread_stop(IOThread *iothread)
         return;
     }
     iothread->stopping = true;
-    aio_bh_schedule_oneshot(iothread->ctx, iothread_stop_bh, iothread);
-    qemu_thread_join(&iothread->thread);
+    
+    if (deterministic_enabled()) {
+        /* In deterministic mode, just mark as stopped */
+        iothread->running = false;
+    } else {
+        aio_bh_schedule_oneshot(iothread->ctx, iothread_stop_bh, iothread);
+        qemu_thread_join(&iothread->thread);
+    }
 }
 
 static void iothread_instance_init(Object *obj)
@@ -207,15 +214,23 @@ static void iothread_init(EventLoopBase *base, Error **errp)
         return;
     }
 
-    /* This assumes we are called from a thread with useful CPU affinity for us
-     * to inherit.
-     */
-    qemu_thread_create(&iothread->thread, thread_name, iothread_run,
-                       iothread, QEMU_THREAD_JOINABLE);
+    /* In deterministic mode, don't create a thread - run synchronously */
+    if (deterministic_enabled()) {
+        iothread->thread_id = qemu_get_thread_id();
+        qemu_sem_post(&iothread->init_done_sem);
+        warn_report("IOThread %s running synchronously in deterministic mode", 
+                    thread_name);
+    } else {
+        /* This assumes we are called from a thread with useful CPU affinity for us
+         * to inherit.
+         */
+        qemu_thread_create(&iothread->thread, thread_name, iothread_run,
+                           iothread, QEMU_THREAD_JOINABLE);
 
-    /* Wait for initialization to complete */
-    while (iothread->thread_id == -1) {
-        qemu_sem_wait(&iothread->init_done_sem);
+        /* Wait for initialization to complete */
+        while (iothread->thread_id == -1) {
+            qemu_sem_wait(&iothread->init_done_sem);
+        }
     }
 }
 

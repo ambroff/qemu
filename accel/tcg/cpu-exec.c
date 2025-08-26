@@ -45,6 +45,7 @@
 #include "tb-context.h"
 #include "tb-internal.h"
 #include "internal-common.h"
+#include "qemu/deterministic.h"
 
 /* -icount align implementation. */
 
@@ -1021,6 +1022,17 @@ int cpu_exec(CPUState *cpu)
      * advance/delay we gain here, we try to fix it next time.
      */
     init_delay_params(&sc, cpu);
+
+#ifndef CONFIG_USER_ONLY
+    /* In deterministic mode, limit execution to instruction slice */
+    if (deterministic_enabled() && icount_enabled()) {
+        cpu->icount_budget = MIN(cpu->icount_budget, 
+                                 (int32_t)deterministic_cfg.instr_slice);
+        int32_t insns_left = MIN(0xffff, cpu->icount_budget);
+        cpu->neg.icount_decr.u16.low = insns_left;
+        cpu->icount_extra = cpu->icount_budget - insns_left;
+    }
+#endif
 
     ret = cpu_exec_setjmp(cpu, &sc);
 

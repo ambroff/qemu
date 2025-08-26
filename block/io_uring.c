@@ -19,6 +19,7 @@
 #include "qapi/error.h"
 #include "system/block-backend.h"
 #include "trace.h"
+#include "qemu/deterministic.h"
 
 /* Only used for assertions.  */
 #include "qemu/coroutine_int.h"
@@ -392,6 +393,17 @@ int coroutine_fn luring_co_submit(BlockDriverState *bs, int fd, uint64_t offset,
                                   QEMUIOVector *qiov, int type,
                                   BdrvRequestFlags flags)
 {
+    /* In deterministic mode, fall back to synchronous I/O */
+    if (deterministic_enabled()) {
+        ssize_t ret;
+        if (type == QEMU_AIO_READ) {
+            ret = preadv(fd, qiov->iov, qiov->niov, offset);
+        } else {
+            ret = pwritev(fd, qiov->iov, qiov->niov, offset);
+        }
+        return ret < 0 ? -errno : ret;
+    }
+
     int ret;
     AioContext *ctx = qemu_get_current_aio_context();
     LuringState *s = aio_get_linux_io_uring(ctx);

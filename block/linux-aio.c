@@ -17,6 +17,7 @@
 #include "qemu/defer-call.h"
 #include "qapi/error.h"
 #include "system/block-backend.h"
+#include "qemu/deterministic.h"
 
 /* Only used for assertions.  */
 #include "qemu/coroutine_int.h"
@@ -421,6 +422,17 @@ int coroutine_fn laio_co_submit(int fd, uint64_t offset, QEMUIOVector *qiov,
                                 int type, BdrvRequestFlags flags,
                                 uint64_t dev_max_batch)
 {
+    /* In deterministic mode, fall back to synchronous I/O */
+    if (deterministic_enabled()) {
+        ssize_t ret;
+        if (type == QEMU_AIO_READ) {
+            ret = preadv(fd, qiov->iov, qiov->niov, offset);
+        } else {
+            ret = pwritev(fd, qiov->iov, qiov->niov, offset);
+        }
+        return ret < 0 ? -errno : ret;
+    }
+
     int ret;
     AioContext *ctx = qemu_get_current_aio_context();
     struct qemu_laiocb laiocb = {

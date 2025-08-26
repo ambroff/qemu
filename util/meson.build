@@ -1,4 +1,4 @@
-util_ss.add(files('osdep.c', 'cutils.c', 'unicode.c', 'qemu-timer-common.c'))
+util_ss.add(files('osdep.c', 'cutils.c', 'unicode.c', 'qemu-timer-common.c', 'deterministic.c'))
 util_ss.add(files('thread-context.c'), numa)
 if not config_host_data.get('CONFIG_ATOMIC64')
   util_ss.add(files('atomic64.c'))
@@ -86,7 +86,7 @@ if have_block or have_ga
   util_ss.add(files('main-loop.c'))
   util_ss.add(files('qemu-coroutine.c', 'qemu-coroutine-lock.c', 'qemu-coroutine-io.c'))
   util_ss.add(files(f'coroutine-@coroutine_backend@.c'))
-  util_ss.add(files('thread-pool.c', 'qemu-timer.c'))
+  util_ss.add(files('thread-pool.c', 'qemu-timer.c', 'deterministic-queue.c'))
 endif
 if have_block or have_ga or have_user
   util_ss.add(files('qemu-sockets.c'))

@@ -61,9 +61,17 @@ DECLARE_INSTANCE_CHECKER(TCGState, TCG_STATE,
                          TYPE_TCG_ACCEL)
 
 #ifndef CONFIG_USER_ONLY
+#include "qemu/deterministic.h"
+
 bool qemu_tcg_mttcg_enabled(void)
 {
     TCGState *s = TCG_STATE(current_accel());
+    
+    /* Force single-threaded execution in deterministic mode */
+    if (deterministic_enabled()) {
+        return false;
+    }
+    
     return s->mttcg_enabled == ON_OFF_AUTO_ON;
 }
 #endif /* !CONFIG_USER_ONLY */
@@ -91,7 +99,14 @@ static int tcg_init_machine(AccelState *as, MachineState *ms)
     CPUClass *cc = CPU_CLASS(object_class_by_name(target_cpu_type()));
     bool mttcg_supported = cc->tcg_ops->mttcg_supported;
 
-    switch (s->mttcg_enabled) {
+    /* Force single-threaded mode and icount in deterministic mode */
+    if (deterministic_enabled()) {
+        s->mttcg_enabled = ON_OFF_AUTO_OFF;
+        max_threads = 1;
+        /* Note: icount needs to be enabled via command line or separate initialization */
+        warn_report("Deterministic mode enabled: forcing single-threaded TCG");
+    } else {
+        switch (s->mttcg_enabled) {
     case ON_OFF_AUTO_AUTO:
         /*
          * We default to false if we know other options have been enabled
@@ -123,6 +138,7 @@ static int tcg_init_machine(AccelState *as, MachineState *ms)
         break;
     default:
         g_assert_not_reached();
+    }
     }
 #endif
 

@@ -22,6 +22,7 @@
 #include "trace.h"
 #include "block/thread-pool.h"
 #include "qemu/main-loop.h"
+#include "qemu/deterministic.h"
 
 static void do_spawn_thread(ThreadPoolAio *pool);
 
@@ -257,6 +258,21 @@ BlockAIOCB *thread_pool_submit_aio(ThreadPoolFunc *func, void *arg,
     QLIST_INSERT_HEAD(&pool->head, req, all);
 
     trace_thread_pool_submit_aio(pool, req, arg);
+
+    /* In deterministic mode, execute synchronously */
+    if (deterministic_enabled()) {
+        req->state = THREAD_ACTIVE;
+        req->ret = req->func(req->arg);
+        req->state = THREAD_DONE;
+        
+        /* Schedule completion callback immediately */
+        if (cb) {
+            cb(opaque, req->ret);
+        }
+        QLIST_REMOVE(req, all);
+        qemu_aio_unref(req);
+        return NULL;
+    }
 
     qemu_mutex_lock(&pool->lock);
     if (pool->idle_threads == 0 && pool->cur_threads < pool->max_threads) {
